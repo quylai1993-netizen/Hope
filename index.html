@@ -316,11 +316,17 @@ function statsOf(rounds) {
 }
 
 /* ============================== AI: dự đoán nước đi của đối thủ ==============================
-   Mỗi ván lưu nước của bạn + kết quả => suy ra nước của đối thủ. Sáu "chuyên gia" thống kê học
-   từ lịch sử (tần suất, tần suất gần đây, sau nước trước, sau 2 nước trước, phản ứng với nước
-   của bạn, phản ứng sau thắng/hòa/thua). Mỗi chuyên gia được chấm điểm bằng chính lịch sử
-   (log-likelihood so với đoán ngẫu nhiên) rồi trộn theo điểm. Nếu không ai hơn đoán ngẫu nhiên,
-   AI nói thẳng là chưa thấy quy luật. */
+   Mỗi ván lưu nước của bạn + kết quả => suy ra nước của đối thủ. Các "chuyên gia" thống kê học từ
+   lịch sử rồi được chấm điểm bằng chính lịch sử (log-likelihood so với đoán ngẫu nhiên, điểm cũ
+   phai dần để theo kịp khi đối thủ đổi cách chơi) và trộn theo điểm.
+
+   Hai nhóm chuyên gia:
+   1) Nhóm "thói quen đối thủ": tần suất, gần đây, sau nước trước, sau 2 nước trước, phản ứng với
+      nước của bạn, theo vòng Búa → Kéo → Bao. Chỉ đúng khi cùng một đối thủ / nhân vật đối thủ.
+   2) Nhóm "đối thủ đọc bài bạn" (share): đối thủ biết bạn đã ra gì nên khắc nước vừa ra, khắc nước
+      bạn hay ra, khắc nước bạn có xu hướng ra tiếp, hoặc đổi nước theo kết quả ván trước. Các quy luật
+      này được viết theo nước CỦA BẠN (đối thủ ra cách nước của bạn mấy bước) nên vẫn đúng khi đối
+      thủ đổi sang nhân vật khác; vì vậy nhóm này được học chung giữa các phiên và các nhân vật. */
 const PRED = [
   { k: 'freq',   decay: 1,   ctx: (h, t) => '*' },
   { k: 'recent', decay: .82, ctx: (h, t) => '*' },
@@ -328,32 +334,75 @@ const PRED = [
   { k: 'o2',     decay: 1,   ctx: (h, t) => t >= 2 ? '' + h[t - 2].o + h[t - 1].o : null },
   { k: 'm1',     decay: 1,   ctx: (h, t) => t >= 1 ? '' + h[t - 1].m : null },
   { k: 'or',     decay: 1,   ctx: (h, t) => t >= 1 ? h[t - 1].o + h[t - 1].r : null },
+  // đối thủ đi theo vòng, tính theo nước trước của chính họ (gộp 3 ngữ cảnh nên học nhanh hơn o1)
+  { k: 'od',     decay: 1,   ctx: (h, t) => t >= 1 ? '*' : null, rel: (h, t) => h[t - 1].o },
+  // ---- đối thủ đọc bài bạn: kết quả học là "đối thủ ra cách mốc bao nhiêu bước", mốc là nước của bạn ----
+  { k: 'cl',     decay: 1,   share: true, ctx: (h, t) => t >= 1 ? '*' : null, rel: (h, t) => h[t - 1].m },
+  { k: 'cf',     decay: 1,   share: true, ctx: (h, t) => '*', rel: (h, t) => favOf(h, t) },
+  { k: 'cm',     decay: 1,   share: true, ctx: (h, t) => '*', rel: (h, t) => habitOf(h)[t] },
+  { k: 'cr',     decay: 1,   share: true, ctx: (h, t) => t >= 1 ? h[t - 1].r : null, rel: (h, t) => h[t - 1].m },
 ];
+const GAMMA = .98, FAV_WIN = 12;
 const probsFrom = c => { const a = .5, s = c[0] + c[1] + c[2] + 3 * a; return [(c[0] + a) / s, (c[1] + a) / s, (c[2] + a) / s]; };
 
-function analyze(seqs) {                            // seqs: các chuỗi ván đã giải mã; chuỗi cuối là phiên hiện tại
+/* nước bạn hay ra nhất trong FAV_WIN ván gần nhất (null nếu chưa rõ) */
+function favOf(h, t) {
+  if (t < 3) return null;
+  const k = [0, 0, 0];
+  for (let i = Math.max(0, t - FAV_WIN); i < t; i++) k[h[i].m]++;
+  const mx = Math.max(...k);
+  return mx >= 2 && k.filter(x => x === mx).length === 1 ? k.indexOf(mx) : null;
+}
+/* thói quen của bạn: đối thủ đoán nước kế tiếp của bạn từ "sau nước X bạn hay ra gì" (chỉ dùng thứ họ đã thấy) */
+function habitOf(h) {
+  if (h.habit) return h.habit;
+  const n = h.length, out = new Array(n + 1).fill(null), tr = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let t = 1; t <= n; t++) {
+    if (t >= 2) tr[h[t - 2].m][h[t - 1].m]++;
+    const row = tr[h[t - 1].m], mx = Math.max(...row);
+    out[t] = mx > 0 && row.filter(x => x === mx).length === 1 ? row.indexOf(mx) : null;
+  }
+  return h.habit = out;
+}
+
+/* own: các chuỗi cho nhóm "thói quen đối thủ" (chuỗi cuối là phiên hiện tại).
+   shared: các chuỗi cho nhóm "đối thủ đọc bài bạn" (chuỗi cuối là toàn bộ lịch sử của nhân vật đang xét);
+   bỏ trống thì dùng luôn own. */
+function analyze(own, shared) {
+  shared = shared || own;
   const P = PRED.map(p => ({ p, counts: new Map(), S: 0 }));
-  for (const h of seqs) {
+  const feed = (h, share) => {
     for (let t = 0; t < h.length; t++) {
       for (const q of P) {
+        if (!!q.p.share !== share) continue;
+        q.S *= GAMMA;
         const ctx = q.p.ctx(h, t); if (ctx === null) continue;
+        const ref = q.p.rel ? q.p.rel(h, t) : 0; if (ref === null) continue;
+        const sym = (h[t].o - ref + 3) % 3;
         let c = q.counts.get(ctx); if (!c) { c = [0, 0, 0]; q.counts.set(ctx, c); }
-        q.S += Math.log(probsFrom(c)[h[t].o] * 3);
+        q.S += Math.log(probsFrom(c)[sym] * 3);
         if (q.p.decay < 1) { c[0] *= q.p.decay; c[1] *= q.p.decay; c[2] *= q.p.decay; }
-        c[h[t].o]++;
+        c[sym]++;
       }
     }
-  }
-  const cur = seqs[seqs.length - 1] || [], t = cur.length, TAU = .6;
+  };
+  own.forEach(h => feed(h, false));
+  shared.forEach(h => feed(h, true));
+  const curO = own[own.length - 1] || [], curS = shared[shared.length - 1] || [], TAU = .6;
   const items = P.map(q => {
-    const ctx = q.p.ctx(cur, t), c = ctx !== null ? q.counts.get(ctx) : null;
-    return { k: q.p.k, ctx, c, probs: c ? probsFrom(c) : [1 / 3, 1 / 3, 1 / 3], S: q.S };
+    const cur = q.p.share ? curS : curO, t = cur.length;
+    const ctx = q.p.ctx(cur, t), ref = ctx !== null && q.p.rel ? q.p.rel(cur, t) : 0;
+    const c = ctx !== null && ref !== null ? q.counts.get(ctx) : null, r = ref === null ? 0 : ref;
+    const ps = c ? probsFrom(c) : [1 / 3, 1 / 3, 1 / 3];       // ps[d]: xác suất đối thủ ra cách mốc d bước
+    return { k: q.p.k, ctx, ref: r, c, ps, probs: [0, 1, 2].map(j => ps[(j - r + 3) % 3]), S: q.S, share: !!q.p.share };
   });
+  const R = items.length;                            // niềm tin ban đầu 50/50 giữa "đối thủ ngẫu nhiên" và "có quy luật": nhiều chuyên gia thì cần bằng chứng mạnh hơn mới tin
   const ws = items.map(i => Math.exp(TAU * Math.max(-40, Math.min(40, i.S))));
-  const sum = ws.reduce((a, b) => a + b, 0) + 1;      // +1 = chuyên gia "đối thủ ngẫu nhiên"
-  const p = [1 / 3 / sum, 1 / 3 / sum, 1 / 3 / sum];
+  const sum = ws.reduce((a, b) => a + b, 0) + R;
+  const p = [R / 3 / sum, R / 3 / sum, R / 3 / sum];
   items.forEach((it, i) => { it.w = ws[i] / sum; for (let j = 0; j < 3; j++) p[j] += it.w * it.probs[j]; });
-  return { n: seqs.reduce((a, s) => a + s.length, 0), p, items, edge: 1 - 1 / sum };
+  const len = a => a.reduce((s, x) => s + x.length, 0);
+  return { n: Math.max(len(own), len(shared)), p, items, edge: 1 - R / sum };
 }
 function seqsFor(c) {
   const cur = c.rounds.map(dec);
@@ -361,6 +410,15 @@ function seqsFor(c) {
   const arcs = [...c.archives].sort((x, y) => x.at < y.at ? -1 : 1).map(a => a.rounds.map(dec)).filter(s => s.length);
   return [...arcs, cur];
 }
+/* nhóm "đối thủ đọc bài bạn" học từ: mọi nhân vật khác + toàn bộ lịch sử (cả phiên đã lưu) của nhân vật này.
+   Nhờ vậy khi đối thủ đổi nhân vật và bạn bấm "Đối thủ đổi", quy luật bắt bài vẫn còn nguyên. */
+function sharedFor(c) {
+  if (!state.settings.crossLearn) return null;
+  const tail = (id, k) => allRounds(state.chars[id]).slice(-k).map(dec);          // chỉ lấy phần gần nhất cho nhẹ máy
+  const others = state.order.filter(id => id !== c.id).map(id => tail(id, 300)).filter(s => s.length);
+  return [...others, tail(c.id, 600)];
+}
+const analysisOf = c => analyze(seqsFor(c), sharedFor(c));
 const evalMove = (a, m) => ({ W: a.p[(m + 1) % 3], D: a.p[m], L: a.p[(m + 2) % 3] });
 function bestMove(a) {
   let bm = 0, bv = -9;
@@ -375,29 +433,42 @@ function advise(a, m) {
   const change = conf > 0 && bm !== m && (be.W - be.L) - (ev.W - ev.L) > .12;
   return { ev, verdict: top[0], conf, bm, be, change };
 }
-function reasonOf(a) {
+function topItem(a) {                               // chuyên gia đóng góp nhiều nhất vào nhận định
   let best = null, score = 0;
   for (const it of a.items) {
     if (!it.c) continue;
-    const kl = it.probs.reduce((s, x) => s + x * Math.log(3 * x), 0), sc = it.w * kl;
+    const kl = it.ps.reduce((s, x) => s + x * Math.log(3 * x), 0), sc = it.w * kl;
     if (sc > score) { score = sc; best = it; }
   }
-  if (!best || Math.max(...best.probs) < .42) return 'Chưa thấy quy luật rõ ràng trong các ván trước.';
-  const j = best.probs.indexOf(Math.max(...best.probs)), B = MV_NAME[j];
-  const tot = Math.round(best.c[0] + best.c[1] + best.c[2]), hit = Math.round(best.c[j]), ctx = best.ctx;
+  return best && Math.max(...best.ps) >= .42 ? best : null;
+}
+function reasonOf(a) {
+  const best = topItem(a);
+  if (!best) return 'Chưa thấy quy luật rõ ràng trong các ván trước.';
+  const d = best.ps.indexOf(Math.max(...best.ps)), j = (best.ref + d) % 3, B = MV_NAME[j], A = MV_NAME[best.ref];
+  const tot = Math.round(best.c[0] + best.c[1] + best.c[2]), hit = Math.round(best.c[d]), ctx = best.ctx, cnt = `(${hit}/${tot} lần)`;
   switch (best.k) {
     case 'freq': return `Đối thủ hay ra ${B} (${hit}/${tot} ván).`;
     case 'recent': return `Mấy ván gần đây đối thủ hay ra ${B} (khoảng ${pc(best.probs[j])}%).`;
-    case 'o1': return `Sau khi ra ${MV_NAME[+ctx]}, đối thủ thường ra ${B} ở ván kế (${hit}/${tot} lần).`;
-    case 'o2': return `Sau chuỗi ${MV_NAME[+ctx[0]]} → ${MV_NAME[+ctx[1]]}, đối thủ thường ra ${B} (${hit}/${tot} lần).`;
-    case 'm1': return `Khi bạn ra ${MV_NAME[+ctx]}, ván sau đối thủ thường ra ${B} (${hit}/${tot} lần).`;
-    case 'or': return `Sau ván bạn ${RES_NAME[ctx[1]].toLowerCase()} (đối thủ ra ${MV_NAME[+ctx[0]]}), đối thủ thường ra ${B} (${hit}/${tot} lần).`;
+    case 'o1': return `Sau khi ra ${MV_NAME[+ctx]}, đối thủ thường ra ${B} ở ván kế ${cnt}.`;
+    case 'o2': return `Sau chuỗi ${MV_NAME[+ctx[0]]} → ${MV_NAME[+ctx[1]]}, đối thủ thường ra ${B} ${cnt}.`;
+    case 'm1': return `Khi bạn ra ${MV_NAME[+ctx]}, ván sau đối thủ thường ra ${B} ${cnt}.`;
+    case 'or': return `Sau ván bạn ${RES_NAME[ctx[1]].toLowerCase()} (đối thủ ra ${MV_NAME[+ctx[0]]}), đối thủ thường ra ${B} ${cnt}.`;
+    case 'od': return d === 1 ? `Đối thủ hay đi theo vòng Búa → Kéo → Bao: sau ${A} thì ra ${B} ${cnt}.`
+      : d === 2 ? `Đối thủ hay đi ngược vòng: sau ${A} thì ra ${B} ${cnt}.` : `Đối thủ hay lặp lại nước cũ (${A}) ${cnt}.`;
+    case 'cl': return d === 2 ? `Đối thủ đang đọc bài bạn: hay khắc nước bạn vừa ra (bạn ra ${A} thì họ ra ${B}) ${cnt}.`
+      : d === 0 ? `Đối thủ hay ra giống nước bạn vừa ra (bạn ra ${A} thì họ ra ${B}) ${cnt}.` : `Sau khi bạn ra ${A}, đối thủ hay ra ${B} (đoán bạn sẽ đổi nước) ${cnt}.`;
+    case 'cf': return d === 2 ? `Đối thủ đang đọc bài bạn: hay khắc nước bạn ra nhiều nhất (${A}) bằng ${B} ${cnt}.`
+      : `Nước bạn hay ra nhất là ${A}; đối thủ hay đáp bằng ${B} ${cnt}.`;
+    case 'cm': return d === 2 ? `Đối thủ đang đọc thói quen của bạn: đoán bạn sắp ra ${A} rồi khắc bằng ${B} ${cnt}.`
+      : `Theo thói quen của bạn (dễ ra ${A}), đối thủ hay ra ${B} ${cnt}.`;
+    case 'cr': return `Sau ván bạn ${RES_NAME[ctx].toLowerCase()} (bạn ra ${A}), đối thủ hay ra ${B}${d === 2 ? ', tức khắc nước đó' : ''} ${cnt}.`;
   }
   return '';
 }
 
 /* ============================== dữ liệu: chuẩn hóa & lưu ============================== */
-const DEFAULT_SETTINGS = { mode: 'independent', autoRoll: true, learnArchives: false };
+const DEFAULT_SETTINGS = { mode: 'independent', autoRoll: true, learnArchives: false, crossLearn: true };
 function normChar(id, c) {
   if (!c || typeof c !== 'object') return null;
   const okR = a => (Array.isArray(a) ? a : []).filter(s => typeof s === 'string' && ROUND_RE.test(s));
@@ -428,6 +499,7 @@ function normState(raw) {
     mode: s.mode === 'distinct' ? 'distinct' : 'independent',
     autoRoll: s.autoRoll === undefined ? DEFAULT_SETTINGS.autoRoll : !!s.autoRoll,
     learnArchives: !!s.learnArchives,
+    crossLearn: s.crossLearn === undefined ? DEFAULT_SETTINGS.crossLearn : !!s.crossLearn,
   };
   return { chars, order, active, settings };
 }
@@ -703,7 +775,7 @@ function aiHTML(c, a, m) {
     <p class="ai-line dim">${esc(reasonOf(a))} Độ tin cậy: ${CONF[v.conf]}.</p>${oppLine}</div>`;
 }
 function cardHTML(id, slot) {
-  const c = state.chars[id], st = statsOf(c.rounds), a = analyze(seqsFor(c)), m = c.pending, n1 = c.rounds.length + 1;
+  const c = state.chars[id], st = statsOf(c.rounds), a = analysisOf(c), m = c.pending, n1 = c.rounds.length + 1;
   const rbtn = `<button class="btn small" data-act="rollOne" data-id="${id}" style="margin-top:10px">${m === null ? 'Random' : 'Random lại'}</button>`;
   const stage = m === null
     ? `<div class="ring empty" data-glyph="${id}">?</div><div class="tx"><div class="mv">Chưa random</div><div class="mv-sub">Bấm Random để có nước đi ván ${n1}</div>${rbtn}</div>`
@@ -722,6 +794,7 @@ function cardHTML(id, slot) {
     <div class="strip-wrap"><div class="cap">${last}</div><div class="strip">${recent}</div></div>
     <div class="foot"><button class="btn ghost small" data-act="undo" data-id="${id}" ${c.rounds.length ? '' : 'disabled'}>Hoàn tác</button>
       <button class="btn ghost small" data-act="reset" data-id="${id}" ${c.rounds.length ? '' : 'disabled'}>Reset…</button>
+      <button class="btn ghost small" data-act="swap" data-id="${id}" ${c.rounds.length ? '' : 'disabled'} title="Lưu phiên hiện tại và bắt đầu phiên mới. AI quên thói quen cũ của đối thủ nhưng vẫn giữ quy luật đối thủ đọc bài bạn.">Đối thủ đổi</button>
       <span class="sp"></span><button class="btn ghost small" data-act="goHist" data-id="${id}">Xem lịch sử</button></div>
   </article>`;
 }
@@ -746,7 +819,7 @@ function viewPlay() {
   return `<section class="panel"><h2>Đội hình</h2><p class="hint">${act.length >= MAX_ACTIVE ? 'Bàn đã đủ 3 nhân vật. Bấm một tên đang chọn để rời bàn, rồi chọn người khác.' : 'Chọn tối đa ' + MAX_ACTIVE + ' nhân vật chơi cùng lúc.'} Bấm vào tên trên mỗi thẻ để điền tên.</p>
     <div class="chips">${chips}<button class="chip-btn add" data-act="add">+ Nhân vật mới</button></div></section>
     ${rollbar}${cards}
-    <p class="note">AI chạy ngay trên trang này: từ lịch sử của từng nhân vật, nó suy ra đối thủ hay ra nước nào rồi tính khả năng thắng, hòa, thua cho nước bạn vừa random. Đây là xác suất thống kê, không phải lời hứa. Nếu đối thủ ra thật sự ngẫu nhiên thì AI sẽ báo là chưa thấy quy luật.</p>`;
+    <p class="note">AI chạy ngay trên trang này: từ lịch sử của từng nhân vật, nó suy ra đối thủ hay ra nước nào rồi tính khả năng thắng, hòa, thua cho nước bạn vừa random. Đây là xác suất thống kê, không phải lời hứa. Nếu đối thủ ra thật sự ngẫu nhiên thì AI sẽ báo là chưa thấy quy luật. AI cũng đoán trường hợp đối thủ biết bạn đã ra gì và khắc lại; khi đối thủ đổi nhân vật, bấm “Đối thủ đổi” trên thẻ để AI bỏ thói quen cũ nhưng giữ quy luật bắt bài.</p>`;
 }
 
 /* ---------- lịch sử ---------- */
@@ -803,7 +876,7 @@ function viewHist() {
   }
   let aiSee = '';
   if (s.id === 'current') {
-    const a = analyze(seqsFor(c));
+    const a = analysisOf(c);
     aiSee = a.n >= MIN_AI ? `<p class="ai-see"><b>AI đang thấy:</b> ${esc(reasonOf(a))}</p>` : `<p class="ai-see">AI cần thêm ${MIN_AI - a.n} ván để bắt đầu nhận định.</p>`;
   }
   const cur = st.cur ? `${RES_NAME[st.cur.r]} ×${st.cur.k}` : '–';
@@ -836,7 +909,8 @@ function viewChars() {
       <div class="rows">${rows}</div><div class="actions"><button class="btn fill small" data-act="add">+ Nhân vật mới</button></div></section>
     <section class="panel"><h2>Cài đặt</h2>
       ${sw('autoRoll', 'Tự random ván kế tiếp', 'Vừa ghi kết quả xong là nhân vật đó có ngay nước đi mới kèm nhận định của AI.')}
-      ${sw('learnArchives', 'AI học cả các phiên đã lưu', 'Tắt: AI chỉ học phiên hiện tại, hợp khi đối thủ đã đổi. Bật: thêm dữ liệu từ các lần reset trước.')}</section>
+      ${sw('learnArchives', 'AI học cả các phiên đã lưu', 'Tắt: AI chỉ học phiên hiện tại, hợp khi đối thủ đã đổi. Bật: thêm dữ liệu từ các lần reset trước.')}
+      ${sw('crossLearn', 'Đối thủ đọc bài bạn: học chung giữa các nhân vật và phiên', 'Bật: khi đối thủ đổi nhân vật, AI vẫn giữ quy luật “họ biết bạn ra gì nên khắc lại” (khắc nước vừa ra, khắc nước hay ra, đoán thói quen). Thói quen riêng của từng đối thủ vẫn chỉ học từ phiên hiện tại.')}</section>
     <section class="panel"><h2>Lưu trữ & sao lưu</h2><p class="hint">${cloudTxt}</p>
       <div class="actions" style="margin-top:0"><button class="btn small" data-act="copyBackup">Sao chép bản sao lưu</button><button class="btn small" data-act="restoreBackup">Dán để khôi phục…</button><button class="btn small ghost" data-act="demo">Thêm nhân vật demo</button></div></section>`;
 }
@@ -940,6 +1014,12 @@ const ACT = {
     commit({ chars: [id] }); toast(`Đã hoàn tác ván cuối của ${c.name}.`);
   },
   reset(id) { resetFlow(id); },
+  swap(id) {                                        // đối thủ đổi nhân vật: lưu phiên, giữ nguyên nước đang random cho ván này
+    const c = state.chars[id]; if (!c || !c.rounds.length) return;
+    archiveCurrent(c, 'Đối thủ đổi nhân vật'); c.rounds = [];
+    commit({ chars: [id] });
+    toast(`Đã lưu phiên của ${c.name} và bắt đầu phiên mới. AI giữ quy luật đối thủ đọc bài bạn.`);
+  },
   setMode(id, x) { state.settings.mode = x; commit({ meta: true }); },
   setOpt(id, x, el) { state.settings[x] = el.checked; commit({ meta: true }); },
   goHist(id) { ui.hc = id; ui.hs = 'current'; ui.rows = 50; ui.tab = 'hist'; render(); window.scrollTo(0, 0); },
